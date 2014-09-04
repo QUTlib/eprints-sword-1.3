@@ -7,10 +7,11 @@ use Digest::MD5;
 
 use EPrints;
 use EPrints::Sword::Utils;
-use EPrints::TempDir;
  
 use Apache2::RequestRec ();
 use Apache2::RequestIO ();
+
+use Encode qw(encode);
 
 
 sub handler 
@@ -168,96 +169,40 @@ sub handler
 		$session->terminate;
 		return Apache2::Const::DONE;
 	}
+        # Store the request content in a temporary file
+        my $file;
+        eval
+            {
+                $file = _read_content( $request );
+                1;
+            }
+                or do
+                    {
+                        # There has been an error preparing the temp
+                        # files or with the checksum
+                        if ( $@ eq "http://purl.org/net/sword/error/ErrorChecksumMismatch" )
+                            {
+                                $verbose_desc .= "[ERROR] MD5 checksum is incorrect.\n";
+                                my $error_doc = EPrints::Sword::Utils::generate_error_document( $session,
+                                                                                                user_agent => $headers->{user_agent},
+                                                                                                summary => "MD5 checksum is incorrect",
+                                                                                                href => "http://purl.org/net/sword/error/ErrorChecksumMismatch",
+                                                                                                verbose_desc => ($VERBOSE ? $verbose_desc : undef) );
+                                $request->headers_out->{'Content-Length'} = length $error_doc;
+                                $request->content_type('application/atom+xml');
+                                $request->print( $error_doc );
+                                $request->headers_out->{'X-Error-Code'} = 'ErrorChecksumMismatch';
+                                $request->status( 412 );
+                                $session->terminate;
+                                return Apache2::Const::DONE;
+                            }
+                        else
+                            {
+                                $request->status( 500 );
+                                return Apache2::Const::DONE;
+                            }
 
-	$session->read_params();
-
-	# Saving the data/file sent through POST
-        my $postdata = $session->{query}->{'POSTDATA'};
-
- 	# This is because CGI.pm (>3.15) has changed:
-        if( !defined $postdata || scalar @$postdata < 1 )
-	{
-		push @$postdata, $session->{query}->param( 'POSTDATA' );
-	}
-		
-	# to let cURL works
-        if( !defined $postdata || scalar @$postdata < 1 )
-        {
-		push @$postdata, $session->{query}->param();
-	}
-
-        if( !defined $postdata || scalar @$postdata < 1 )
-        {
-		$verbose_desc .= "[ERROR] No files found in the postdata.\n";
-
-                my $error_doc = EPrints::Sword::Utils::generate_error_document( $session,
-					user_agent => $headers->{user_agent},
-					summary => "Missing postdata.",
-                                        href => "http://purl.org/net/sword/error/ErrorBadRequest",
-					verbose_desc => ($VERBOSE ? $verbose_desc : undef) );
-
-                $request->headers_out->{'Content-Length'} = length $error_doc;
-                $request->content_type('application/atom+xml');
-                $request->print( $error_doc );
-		$request->headers_out->{'X-Error-Code'} = 'ErrorBadRequest';
-		$request->status( 400 );
-		$session->terminate;
-		return Apache2::Const::DONE;
-        }
-
-        my $post = $$postdata[0];
-
-	# Check the MD5 we received is correct
-	if(defined $headers->{md5})
-	{
-                my $real_md5 = Digest::MD5::md5_hex( $post );
-                if( $real_md5 ne $headers->{md5} )
-                {
-			$verbose_desc .= "[ERROR] MD5 checksum is incorrect.\n";
-
-			my $error_doc = EPrints::Sword::Utils::generate_error_document( $session,
-					user_agent => $headers->{user_agent},
-						summary => "MD5 checksum is incorrect",
-						href => "http://purl.org/net/sword/error/ErrorChecksumMismatch",
-						verbose_desc => ($VERBOSE ? $verbose_desc : undef) );
-
-			$request->headers_out->{'Content-Length'} = length $error_doc;
-			$request->content_type('application/atom+xml');
-			$request->print( $error_doc );
-			$request->headers_out->{'X-Error-Code'} = 'ErrorChecksumMismatch';
-			$request->status( 412 );
-			$session->terminate;
-			return Apache2::Const::DONE;
-                }
-	}
-
-	# Create a temp directory which will be automatically removed by PERL
-	my $tmp_dir = EPrints::TempDir->new( "swordXXXXX", UNLINK => 1 );
- 
-	if( !defined $tmp_dir )
-        {
-                print STDERR "\n[SWORD-DEPOSIT] [INTERNAL-ERROR] Failed to create the temp directory!";
-		$request->status( 500 );
-		$session->terminate;
-                return Apache2::Const::DONE;
-        }
-
-	# Save post data to file
-	my $file = $tmp_dir.'/'.$headers->{filename};
-
-        if (open( TMP, '+>'.$file ))
-        {
-		binmode( TMP );
-		print TMP $post;
-		close(TMP);
-        }
-        else
-	{
-		print STDERR "\n[SWORD-DEPOSIT] [INTERNAL-ERROR] Failed to create the temp file because: $!";
-		$request->status( 500 );
-		$session->terminate;
-		return Apache2::Const::DONE;
-	}
+                    };
 
 
 	my $xpackage = $headers->{x_packaging};
@@ -423,9 +368,8 @@ sub handler
 	my $xml = EPrints::Sword::Utils::create_xml( $session, %xml_opts );
 
 	$request->headers_out->{'Location'} = EPrints::Sword::Utils::get_atom_url( $session, $eprint );
-	$request->headers_out->{'Content-Length'} = length $xml;
+	$request->headers_out->{'Content-Length'} = length( encode( 'UTF-8', $xml ) );
 	$request->content_type('application/atom+xml');
-
 	$request->print( $xml );
 	$request->status( 201 );	# Created
 
@@ -433,5 +377,44 @@ sub handler
 	return Apache2::Const::OK;
 }
 
+
+#
+# File::Temp = _read_content( $request )
+#
+# Stores the body of $request in a temporary file and returns a
+# filehandle. Dies if the checksum in the request doesn't match the
+# generated checksum.
+#
+# Adapted from EPrints::Apache::CRUD in EPrints 3.3
+#
+sub _read_content
+{
+    my( $request ) = @_;
+
+    my $headers = $request->headers_in();
+
+    my $ctx = $headers->{'content-md5'} ? Digest::MD5->new() : undef;
+
+    my $tmpfile = File::Temp->new( SUFFIX => $headers->{extension} );
+    binmode($tmpfile);
+    my $len = 0;
+
+    while ( $request->read( my $buffer, 4096 ) )
+    {
+        $len += length( $buffer );
+        $ctx->add( $buffer ) if defined $ctx;
+        print $tmpfile $buffer;
+    }
+    seek($tmpfile,0,0);
+
+    if ( defined $ctx && $ctx->hexdigest ne $headers->{'content-md5'} )
+    {
+        die( "http://purl.org/net/sword/error/ErrorChecksumMismatch" );
+    }
+
+    # Return the filehandle to the modified EPrintsXML and the data
+    # files.
+    return $tmpfile;
+}
 1;
 
